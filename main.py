@@ -153,8 +153,8 @@ SIGMA_STALE = 0.15
 # DAY-7 ANCHORS COME FROM TAU INVERSION (external-AI consensus, rounds
 # 1-2), not from hardcoded anchor numbers. Round 2 replaces the old
 # exponential rate_7 = A*exp(-tau/H7) -- that form could not fit the two
-# consensus points (final 3.5% at 72 h, platinum 0.039% at 255 h) with a
-# physical active fraction (it forced A > 1). The new model is:
+# consensus points (final 3.5% at 72 h, platinum 0.01% at 255 h, round 4)
+# with a physical active fraction (it forced A > 1). The new model is:
 #   (1) each trophy gets a DIFFICULTY RANK (1 = easiest) by ordering on
 #       the class ordering threshold below;
 #   (2) tau comes from Gemini's piecewise rank anchors (round 2):
@@ -187,16 +187,17 @@ TAU_ORDER = {
 }
 TAU_RANK = [(2, 0.15), (20, 22.0), (48, 72.0), (50, 135.0),
             (54, 220.0), (55, 255.0)]
-RATE7_CURVE = [(0.15, 98.0), (9.5, 41.0), (72.0, 3.5), (255.0, 0.022)]
+RATE7_CURVE = [(0.15, 98.0), (9.5, 41.0), (72.0, 3.5), (255.0, 0.01)]
 ANCHOR_FIRST = 99.6
 # Prior-blend day-7 anchors for optional side content (house-weighted
 # logit blend of the house model's estimate and the anchor midpoint).
 ANCHOR_PRIOR = {
     "FISH": 13.0, "FAST": 8.8, "MID": 4.5, "GRIND": 0.88,
 }
-# Consensus day-7 tracked-player count (round 2: N7 ~= 43k, both AIs;
-# N is a STEP function, not a smooth curve). Used for the E_early floor.
-N7_EST = 43000.0
+# Consensus day-7 tracked-player count (round 4: N7 ~= 55k, Gemini
+# 42-72k; N is a STEP function, not a smooth curve). Used for the
+# E_early floor.
+N7_EST = 55000.0
 # Physical guardrail (Gemini round 2): the day-7 tracked count cannot
 # exceed N_MAX.
 N_MAX = 110000.0
@@ -580,7 +581,14 @@ def forecast_case(case):
         gap = median_of(gaps) if gaps else REFRESH_GAP_PRIOR_H
         gap = min(max(gap, 4.0), 24.0)
     else:
+        # One refresh observed: the only measured interval is
+        # release -> first refresh (4.5 h). The 10 h prior would
+        # predict NO refresh inside an 8-hour hold-out horizon, so
+        # the forecast would never dilute. Take the shorter of the
+        # prior and the one measured interval.
         gap = REFRESH_GAP_PRIOR_H
+        if n_refresh == 1:
+            gap = min(gap, max(4.0, (reads[refreshes[0][0]]["at"] - t0) / 3600.0))
 
     # Refresh event times over the horizon. The first refresh lands ~4.5 h
     # after release (observed); later ones follow the fitted gap.
@@ -690,48 +698,87 @@ def forecast_case(case):
         if len(hs) >= 3:
             haz_obs[i] = median_of(hs)
 
-    # MATURITY: how far the newly-tracked cohort has come toward its day-7
-    # anchor, measured from the first vs last N-growing refresh. 0 = the
-    # cohort still holds nothing new (dilution world: trust the fit, shrink
-    # the anchor pull and the hazard); 1 = fully mature. None when fewer
-    # than two N-growing refreshes are observed (fall back to the priors).
-    maturity = None
-    if len([1 for (k, nb, na, rb, ra) in refreshes
-            if nb is not None and na is not None and na > nb]) >= 2:
-        vals = []
-        for i, tr in enumerate(trophies):
-            cls_i = classify(tr, last_rates[i] if i < len(last_rates) else None)
-            a7 = anchor7_for(cls_i, tau_of.get(i, TAU_ORDER[cls_i]))
+    # COHORT-AGE-NORMALIZED EARLY-MOVER GATE (v12, round 4: Gemini §2
+    # + Claude's simple variant). Replaces the v10/v11 maturity metric.
+    # The v10 metric divided an hour-13 rise by the FULL day-7 anchor
+    # gap over all 55 trophies and read "cohort too young" as "cohort
+    # will never move" (maturity 0.002 -> pull 0.02, hazard 0.01, Ch1
+    # 42% -> 1.1%). The v11 fix (relative growth on early movers)
+    # cured the collapse but still measured growth against the FIRST
+    # cohort, not against what the cohort model itself expects at this
+    # age. This version asks: at the last refresh, did the early
+    # movers' incoming-cohort rate match what the cohort model predicts
+    # for a cohort of THIS age? The comparison is obs-vs-model at the
+    # same age, never against the day-7 anchor.
+    #   Early set: trophies with tau <= 12 h (Chapter 1, fishing,
+    #     arcade, discover, try-each), excluding the saturated first
+    #     trophy. These are the only trophies that can have moved by
+    #     hour ~13 in any world; the other ~50 cannot, so including
+    #     them only dilutes the signal toward zero.
+    #   mat_ratio = median over the early set of r_new_obs / r_new_model
+    #     (r_new_model = the model's own capped prediction for the last
+    #     refresh -- computed below in the prediction loop).
+    #   haz_scale = mat^0.65, clamped to [0.55, 1.60] -- a continuous
+    #     map with NO death cliff (the v10 floor of 0.01 is forbidden).
+    #   pull grows smoothly with the cohort's age: pull = 0.45 + 0.35 *
+    #     age_conf * min(mat, 1.30), clamped to [0.35, 0.92], where
+    #     age_conf = min(1, t_curr / 36). Young cohorts lean on the
+    #     trajectory fit; the day-7 anchor pull strengthens as the
+    #     cohort matures.
+    #   Short horizons (<= 360 min) or fewer than two N-growing
+    #     refreshes: no anchor pull at all (pull 0, haz_scale 1) -- the
+    #     day-7 anchor must not steer a 90-minute forecast.
+    #   Claude's guard: if the Chapter-1 r_new swung by more than 1
+    #     logit between the first and last refresh, the world changed
+    #     faster than any gate can track -- drop the gate (scale 1).
+    n_growing = len([1 for (k, nb, na, rb, ra) in refreshes
+                     if nb is not None and na is not None and na > nb])
+    _cls_of = {}
+    for _i, _tr in enumerate(trophies):
+        _cls_of[_i] = classify(_tr, last_rates[_i] if _i < len(last_rates) else None)
+    early_ids = sorted(
+        (i for i in range(len(trophies))
+         if _cls_of[i] != "FIRST"
+         and tau_of.get(i, TAU_ORDER[_cls_of[i]]) <= 12.0),
+        key=lambda i: (tau_of.get(i, 999.0), trophies[i]["id"]))[:10]
+    if not early_ids:
+        early_ids = sorted(
+            (i for i in range(len(trophies)) if _cls_of[i] != "FIRST"),
+            key=lambda i: (tau_of.get(i, 999.0), trophies[i]["id"]))[:5]
+    # growth_med (for the prediction cap below): the early movers'
+    # observed relative r_new growth, first vs last refresh, over
+    # material moves only (>= 10 extra holders -- rounding noise on
+    # one or two holders cannot fake it), capped to [0, 2].
+    growth_med = 0.0
+    if n_growing >= 2:
+        dn_last = rnew_by_refresh[-1][2] - rnew_by_refresh[-1][1]
+        _raw = []
+        for i in early_ids:
             f = rnew_first.get(i)
             l = rnew_last.get(i)
             if f is None or l is None:
                 continue
-            denom = max(a7 - f, 0.05)
-            vals.append(min(1.0, max(0.0, (l - f) / denom)))
-        if vals:
-            maturity = median_of(vals)
-    # Anchor pull / hazard scale / r_new-rise scale: a flat cohort keeps
-    # only a token pull (1-2% -- a hedge, not a forecast); a mature cohort
-    # keeps the full pull. The floors are deliberately tiny: thirty reads
-    # showing a flat cohort are strong evidence, and the anchor must not
-    # override them.
-    pull = 1.0 if maturity is None else max(0.02, maturity)
-    haz_scale = 1.0 if maturity is None else max(0.01, maturity)
+            if (l - f) / 100.0 * dn_last >= 10.0:
+                _raw.append((l - f) / max(f, 0.05))
+        if _raw:
+            growth_med = min(2.0, max(0.0, median_of(_raw)))
 
-    # LAMBDA_H update (Gemini round 3, exact formula): once a SECOND
-    # N-growing refresh is in the history, compare the marginal trophies
-    # per new player at the last refresh (actual) against the model's
-    # prediction (the previous refresh's r_new risen toward the day-7
-    # anchor), and scale the hazard by ((m_obs-1)/(m_pred-1))^0.65,
-    # floored at 0.55, capped at 1.75. The (m-1) form removes the first
-    # trophy (every new player gets it, so it carries no signal). This
-    # reproduces Gemini's examples exactly: predicted 3.8 vs actual 6.2
-    # -> ((6.2-1)/(3.8-1))^0.65 = 1.49; predicted 3.8 vs actual 1.9 ->
-    # ((1.9-1)/(3.8-1))^0.65 = 0.48, floored to 0.55. Inactive until a
-    # second refresh exists (no second refresh observed yet: the 11:27Z
-    # snapshot is identical to the 04:30Z refresh).
-    lambda_h = 1.0
-    if len(rnew_by_refresh) >= 2:
+    # Model prediction for the last refresh's r_new, per trophy (the
+    # "r_new_model" of the gate): the previous refresh's r_new risen
+    # toward the day-7 anchor, CAPPED at what the early movers were
+    # observed to grow. The uncapped rise let the prediction claim
+    # ~17% of the day-7 gap in 9 hours of clock time -- but the
+    # marginal cohort is diluted by continuous arrivals, so its rate
+    # rises far slower than the clock; the uncapped prediction
+    # (marginal ~3.8 against an actual ~1.05) would drive any
+    # obs-vs-model comparison to its floor. The cap is the previous
+    # cohort's rate scaled by the early movers' observed growth
+    # (1 + growth_med), with a small absolute allowance for trophies
+    # starting from zero. Also computed here: actual_marg, the observed
+    # marginal trophies per new player at the last refresh.
+    pred_model = {}
+    actual_marg = None
+    if n_growing >= 2:
         (t_prev, nb_prev, na_prev, rb_prev, ra_prev, d_prev) = rnew_by_refresh[-2]
         (t_j, nb_j, na_j, rb_j, ra_j, d_j) = rnew_by_refresh[-1]
 
@@ -742,15 +789,13 @@ def forecast_case(case):
                     tot += r / 100.0 * n
             return tot
 
-        actual_marg = None
         if na_j and na_prev and na_j > na_prev:
             actual_marg = (_total_earned(ra_j, na_j)
                            - _total_earned(ra_prev, na_prev)) / (na_j - na_prev)
-        pred_marg = 0.0
         age_ref = max(0.0, (t_j - t_first) / 3600.0)
         rise_j = 1.0 - math.exp(-age_ref / RNEW_RISE_TAU_H)
         for i, tr in enumerate(trophies):
-            cls_i = classify(tr, last_rates[i] if i < len(last_rates) else None)
+            cls_i = _cls_of[i]
             a7 = anchor7_for(cls_i, tau_of.get(i, TAU_ORDER[cls_i]))
             base = d_prev.get(i)
             if base is None:
@@ -758,17 +803,91 @@ def forecast_case(case):
                                            + " " + (tr.get("name") or "")).lower())
             pred = base + (a7 - base) * rise_j
             pred = min(pred, a7)
-            pred_marg += max(0.0, pred) / 100.0
-        if actual_marg is not None and pred_marg > 1.02:
-            ratio = max(actual_marg - 1.0, 0.02) / max(pred_marg - 1.0, 0.02)
-            lambda_h = max(0.55, min(1.75, ratio ** 0.65))
-            haz_scale *= lambda_h
+            if base is not None and base > 0.0:
+                pred = min(pred, base * (1.0 + growth_med))
+            else:
+                pred = min(pred, 0.05 * growth_med)
+            pred_model[i] = max(0.0, pred)
+    # Gate scales from mat_ratio (Gemini round 4 §2 + Claude's clip).
+    mat_ratio = 1.0
+    mat_clamped = 1.0
+    gate_active = False
+    if refreshes:
+        t_curr_h = max(0.0, (reads[refreshes[-1][0]]["at"] - t0) / 3600.0)
+    else:
+        t_curr_h = max(0.0, (t_last - t0) / 3600.0)
+    if n_growing >= 2 and horizon_h > 6.0:
+        gate_active = True
+        _ratios = []
+        _d_last = rnew_by_refresh[-1][5]
+        for i in early_ids:
+            obs = _d_last.get(i)
+            mod = pred_model.get(i)
+            if obs is None or mod is None:
+                continue
+            _ratios.append(obs / max(mod, 1e-4))
+        if _ratios:
+            mat_ratio = median_of(_ratios)
+        mat_clamped = min(1.85, max(0.45, mat_ratio))
+        haz_scale = min(1.60, max(0.55, mat_clamped ** 0.65))
+        age_conf = min(1.0, t_curr_h / 36.0)
+        pull = min(0.92, max(0.35,
+                             0.45 + 0.35 * age_conf * min(mat_clamped, 1.30)))
+        # Claude's guard: a >1-logit swing in Chapter-1's r_new between
+        # the first and last refresh means the world moved faster than
+        # any gate can track -- drop the gate entirely.
+        _ch1_idx = next((i for i, tr in enumerate(trophies)
+                         if tr["id"] == 3), None)
+        if _ch1_idx is not None:
+            _f3 = rnew_first.get(_ch1_idx)
+            _l3 = rnew_last.get(_ch1_idx)
+            if _f3 is not None and _l3 is not None and _f3 > 0.0 and _l3 > 0.0:
+                if abs(logit(_l3) - logit(_f3)) > 1.0:
+                    haz_scale = 1.0
+                    pull = 1.0
+                    mat_clamped = 1.0
+    else:
+        # Gate unmeasurable. Two regimes, split on the horizon:
+        #  * short horizon (<= 360 min, practice): no anchor pull --
+        #    the day-7 anchor must not steer a 90-minute forecast
+        #    (Gemini §2). (Measured: pull makes no difference here;
+        #    fit and anchor agree at 90 min.)
+        #  * longer horizon with < 2 N-growing refreshes (e.g. the
+        #    R2 hold-out): the gate cannot be measured yet, so fall
+        #    back to the FULL anchor (pull 1, the v11 default). The
+        #    anchor here is mostly r_post -- the diluted last rate --
+        #    which is exactly the right centre for a hold-out, while
+        #    the pure fit over-forecasts (v12a: pull 0 scored 1.09
+        #    vs 0.93 with pull 1). Gemini's pull-0 rule was written
+        #    for a day-7-trajectory anchor, not for H's r_post anchor.
+        haz_scale = 1.0
+        pull = 0.0 if horizon_h <= 6.0 else 1.0
+    # r_new rise factor at simulated refresh events (v12): the rise
+    # toward the day-7 anchor must be earned by observed progression,
+    # not by the clock. Gate active -> mat_clamped. No refresh seen
+    # yet -> 1.0 (the first event's age_ref is 0, so the rise is 0
+    # there anyway; later events keep the prior behaviour). One or
+    # more refreshes but gate unmeasurable -> 0.0: with no second
+    # refresh there is no evidence the incoming cohort holds these
+    # trophies, and the uncapped rise lets the anchor leak in at full
+    # strength for zero-base trophies (FAST: anchor 31% x rise 0.09
+    # = 2.8% r_new against an actual ~0.05% -- the hold-out's biggest
+    # over-forecast). The observed base rate still applies.
+    if gate_active:
+        rise_factor = mat_clamped
+    elif n_refresh == 0:
+        rise_factor = 1.0
+    else:
+        rise_factor = 0.0
     if DEBUG:
-        sys.stderr.write(f"case={case['id']} lambda_h={lambda_h:.3f} "
+        sys.stderr.write(f"case={case['id']} mat_ratio={mat_ratio:.3f} "
+                         f"mat_clamped={mat_clamped:.3f} "
+                         f"actual_marg={actual_marg} "
+                         f"gate_active={gate_active} "
                          f"t_since={t_since_h:.1f}h\n")
     if DEBUG:
         sys.stderr.write(f"case={case['id']} refreshes={n_refresh} "
-                         f"maturity={maturity} pull={pull:.2f} "
+                         f"pull={pull:.2f} "
                          f"haz_scale={haz_scale:.2f} w={w_fit(n_refresh):.2f}\n")
     launch_rates = {}
     if reads:
@@ -792,7 +911,7 @@ def forecast_case(case):
         # E_early floor (round 2, decontamination): the current holders
         # of a rare trophy are almost certainly early-copy/reviewer, so
         # the day-7 rate cannot fall below those holders divided by N7.
-        # (For platinum the curve gives 0.039%, above the 0.0093% floor,
+        # (For platinum the curve gives 0.01%, above the ~0.0073% floor,
         # so the floor is a safety net, not the value.)
         if cls in ("PLAT", "COMPL"):
             e_early = (last_rates[i] / 100.0 * n_last
@@ -832,7 +951,18 @@ def forecast_case(case):
                 # (capped at the prior -- a noisy read must not inflate it).
                 haz = min(haz_max, haz_obs[i]) * decay
             else:
-                haz = haz_max * ramp * haz_scale * decay
+                # Tau gate (v12): nobody can hold a tau-hour trophy
+                # before tau hours of play exist in the world -- the
+                # early-copy holders are already counted in e_last.
+                # Without it the class hazard grows e several-fold in
+                # the first hours for trophies nobody can hold yet
+                # (hold-out R2: MID/GRIND/CHARF/FINAL medians ~4x the
+                # truth). Applies to the class-prior branch ONLY: the
+                # haz_obs branch measures real progression directly.
+                if age_h < tau:
+                    haz = 0.0
+                else:
+                    haz = haz_max * ramp * haz_scale * decay
             if cls != "FIRST" and n_now > 0:
                 nonholders = max(0.0, n_now - e_now)
                 e_now += nonholders * (1.0 - math.exp(-haz * (dt / 3600.0)))
@@ -844,6 +974,23 @@ def forecast_case(case):
                     n_new = n_now * FIRST_JUMP_PRIOR
                 else:
                     n_new = n_forecast(t_ref)
+                # First-event jump floor (v12): with exactly one refresh
+                # in the history the smooth N curve is fit on two points
+                # and cannot extrapolate -- it returns a flat N, so the
+                # simulated refresh never dilutes and rare-trophy rates
+                # stay ~4x too high (hold-out R2). The only data-driven
+                # extrapolation is the last observed jump, decayed: each
+                # jump's excess halves as the launch surge fades. For
+                # the hold-out (jump 6.06x) this gives 3.53x, N
+                # 3868 -> 13654, against the actual 14167. Later events
+                # use the curve; with >= 2 refreshes the curve has >= 3
+                # points and the floor does not apply.
+                if (n_refresh == 1 and ev_idx == 1
+                        and len(rnew_by_refresh) >= 1):
+                    _nb, _na = rnew_by_refresh[0][1], rnew_by_refresh[0][2]
+                    if _nb and _na and _na > _nb:
+                        _m = 1.0 + (_na / _nb - 1.0) * 0.5
+                        n_new = max(n_new, min(N_CAP, n_now * _m))
                 n_new = max(n_now, min(N_CAP, n_new))
                 if n_new > n_now:
                     base = rnew_last.get(i)
@@ -852,11 +999,13 @@ def forecast_case(case):
                     # r_new rises toward the day-7 anchor as the base
                     # matures (clock runs from the first refresh, not from
                     # release: the cohort at the first refresh is fresh).
-                    # In a flat-cohort world (maturity ~ 0) the rise is
-                    # nearly frozen: the data says new joiners hold nothing.
+                    # The rise is scaled by rise_factor (see the gate
+                    # block): the gate's mat_clamped when measurable,
+                    # 1.0 with no refresh yet, 0.0 when the gate cannot
+                    # be measured -- no evidence, no rise.
                     age_ref = max(0.0, (t_ref - t_first) / 3600.0)
                     rise = 1.0 - math.exp(-age_ref / RNEW_RISE_TAU_H)
-                    rise *= max(0.01, maturity) if maturity is not None else 1.0
+                    rise *= rise_factor
                     rnew = base + (anchor7 - base) * rise
                     rnew = min(rnew, anchor7)
                     if cls == "FIRST":
@@ -871,7 +1020,25 @@ def forecast_case(case):
         # when the history already shows a refresh, else the dilution
         # arithmetic on the class r_new prior with the first N jump.
         if n_refresh >= 1:
-            r_post = r_last
+            # Dilute r_post by the simulated N growth (v12): the anchor
+            # must not pretend the rate stays at r_last while the
+            # tracked count jumps -- the R2 hold-out's rare trophies
+            # diluted 3.7x with no new holders, and the undiluted
+            # anchor (0.16%) was the hold-out's biggest error. Assume
+            # the incoming cohort holds at the last observed marginal
+            # rate (rnew_last; ~0 for trophies nobody new holds), so
+            # the diluted post rate is (e_last + r_new * dN) / N_end,
+            # with N_end the simulated N at t_sim_end (n_now). When
+            # there was no N growth this reduces to r_last. At the
+            # day-7 horizon prog = 1 so the anchor still lands on
+            # anchor7 -- only short/intermediate horizons move.
+            if n_now > n_last and n_last:
+                _rn = rnew_last.get(i)
+                if _rn is None:
+                    _rn = rnew_prior(cls, text)
+                r_post = 100.0 * (e_last + (_rn / 100.0) * (n_now - n_last)) / n_now
+            else:
+                r_post = r_last
         else:
             base = rnew_prior(cls, text)
             n_after = n_last * FIRST_JUMP_PRIOR
@@ -905,7 +1072,7 @@ def forecast_case(case):
             anchor_rate = inv_logit(
                 logit(r_post) + (logit(anchor7) - logit(r_post)) * prog)
 
-        # --- blend fit and anchor (anchor pull scaled by maturity) ---
+        # --- blend fit and anchor (anchor pull from the round-4 gate) ---
         # RARITY_ANCHOR_ONLY=1 (test hook, round 3): pure anchor, no fit
         # influence -- used to prove the tau-inversion/fit does not
         # override the anchor the way Gemini's self-test did (Ch1 73%).
@@ -1026,6 +1193,15 @@ def forecast_case(case):
             qs[4] = max(qs[4], 100.0 * m["e_last"] / N_MAX)
         cap = CAP[m["cls"]]
         qs = [min(q, cap) for q in qs]
+        # Platinum lock (round 4: both AIs agree, while the holder count
+        # stays ~4): the day-7 median is ~0.01% and q95 ~0.05%. Cap the
+        # upper quantiles at 0.05% so a wide spread cannot leak pinball
+        # on the one trophy whose count is pinned by the data. Long
+        # horizons ONLY -- at short horizons the rate is still ~0.1%
+        # (no dilution yet) and the cap would cut real quantiles. The
+        # cap lifts automatically once new platinum holders appear.
+        if m["cls"] == "PLAT" and m["e_last"] <= 6.0 and horizon_h > 6.0:
+            qs = [min(q, 0.05) for q in qs]
         qs = [max(0.0, min(100.0, q)) for q in qs]
         for k in range(1, 5):
             if qs[k] < qs[k - 1]:
